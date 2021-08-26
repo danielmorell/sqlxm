@@ -3,12 +3,64 @@ package sqlxm
 import (
 	"crypto/md5"
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
-	"time"
+	"sync"
 
+	"github.com/danielmorell/sqlxm/backends"
 	"github.com/jmoiron/sqlx"
 )
+
+const (
+	SUCCESS = iota
+	PREVIOUS
+	ERROR
+	ERROR_HASH
+)
+
+var defaultBackends = map[string][]string{
+	"postgres":  {"postgres", "pgx", "pq-timeouts", "cloudsqlpostgres", "ql", "nrpostgres", "cockroach"},
+	"mysql":     {"mysql", "nrmysql"},
+	"sqlite":    {"sqlite3", "nrsqlite3"},
+	"oracle":    {"oci8", "ora", "goracle", "godror"},
+	"sqlserver": {"sqlserver"},
+}
+
+var backendMap sync.Map
+
+func init() {
+	for db, drivers := range defaultBackends {
+		for _, driver := range drivers {
+			backendMap.Store(driver, db)
+		}
+	}
+}
+
+// BackendType returns the backend key for a given database given a driverName.
+func BackendType(driverName string) string {
+	itype, ok := backendMap.Load(driverName)
+	if !ok {
+		return "unknown"
+	}
+	return itype.(string)
+}
+
+var registeredBackends = map[string]Backend{
+	"postgres": &backends.Postgres{},
+}
+
+// RegisterBackend adds a new DB Backend to SQLXM for Migrator to use to run
+// queries. A backend handles peculiarities in SQL dialects and can help
+// abstract alternate implementations.
+func RegisterBackend(key string, backend Backend) error {
+	_, exists := registeredBackends[key]
+	if exists {
+		return errors.New(fmt.Sprintf("backend with key '%s' already exists", key))
+	}
+	registeredBackends[key] = backend
+	return nil
+}
 
 // Migration is a single schema change to apply to the database.
 type Migration struct {
@@ -28,26 +80,28 @@ func (m Migration) run(tx *sql.Tx) error {
 
 // Insert the migration record row into the migration table
 func (m Migration) insertRecord(tx *sql.Tx, migrator *Migrator) error {
-	s := migrator.db.Rebind(migrator.name(`INSERT INTO ?? (name, hash, comment) VALUES (?, ?, ?);`))
-
-	_, err := tx.Exec(s, m.Name, fmt.Sprintf("%x", m.hash), m.Comment)
-
-	return err
-}
-
-type MigrationRecord struct {
-	ID      int       `db:"id"`
-	Name    string    `db:"name"`
-	Hash    string    `db:"hash"`
-	Date    time.Time `db:"date"`
-	Comment string    `db:"comment"`
+	return migrator.backend.InsertRecord(tx, m.Name, m.hash, m.Comment)
 }
 
 type MigrationLog struct {
 	Name    string
 	Hash    string
-	Comment string
-	Error   error
+	Status  int
+	Details string
+}
+
+type Backend interface {
+	// Setup does the initial configuration of the backend.
+	Setup(table string, db *sqlx.DB)
+	// InsertRecord migration record into the DB.
+	InsertRecord(tx *sql.Tx, name string, hash string, comment string) error
+	// HasMigrationTable returns true if the migration table exists.
+	HasMigrationTable() bool
+	// QueryPrevious queries and sets the records of all previous migrations.
+	QueryPrevious() (map[string]string, error)
+	// CreateMigrationTable makes the migrations table, and return the query used to
+	// do it.
+	CreateMigrationTable() (string, error)
 }
 
 // Migrator handles the process of migrating your database. Each instance of
@@ -60,7 +114,29 @@ type Migrator struct {
 	TableName string
 	// All the migration records for the database.
 	migrations []Migration
-	log        []MigrationLog
+	// The log of all migrations that have been run or attempted to be run.
+	log []MigrationLog
+	// Previous migrations to make sure we don't run them twice.
+	previous map[string]string
+	// Strict mode stops migrations and returns an error if the hashes don't
+	// match for a migration.
+	strict bool
+	// The names of migrations that need the hash repaired.
+	repair map[string]bool
+	// Set of added migrations
+	names map[string]bool
+	// The query runner for the db.
+	backend Backend
+}
+
+func (m *Migrator) UseBackend(key string) error {
+	b, ok := registeredBackends[key]
+	if !ok {
+		return errors.New(fmt.Sprintf("backend '%s' is not a registered backend", key))
+	}
+	m.backend = b
+	m.backend.Setup(m.TableName, m.db)
+	return nil
 }
 
 // The AddMigration method adds a new Migration to the list of migrations needed.
@@ -72,10 +148,17 @@ type Migrator struct {
 // migration record in the DB. However, this is strongly discouraged, as it is
 // easy to introduce an error state that will require manual edits to your
 // migration table to fix.
-func (m *Migrator) AddMigration(name string, comment string, statement string, args ...interface{}) {
-	if m.migrations == nil {
-		m.migrations = make([]Migration, 0, 1)
+//
+// An error is returned if a migration with the same name has already been
+// added.
+func (m *Migrator) AddMigration(name string, comment string, statement string, args ...interface{}) error {
+	if m.names[name] {
+		return errors.New(fmt.Sprintf("migration '%s' alraedy exists", name))
 	}
+	// Add name to set
+	m.names[name] = true
+
+	// Create the new migration
 	mig := Migration{
 		Name:      name,
 		Comment:   comment,
@@ -86,71 +169,103 @@ func (m *Migrator) AddMigration(name string, comment string, statement string, a
 	}
 
 	m.migrations = append(m.migrations, mig)
+	return nil
+}
+
+// RepairHash finds an existing migration by name and updates the hash in the
+// DB. This is useful if you are using RunStrict, and there have been
+// non-substantive changes to the Migration.Statement such as formatting or
+// indenting changes.
+//
+// The hash for each name supplied will be updated.
+//
+// Hash repairs will be run just before the migrations and will not be applied
+// if the migrations fail.
+func (m *Migrator) RepairHash(names ...string) {
+	for _, n := range names {
+		m.repair[n] = true
+	}
 }
 
 // Run executes the new migrations against the DB.
+//
+// Run does a couple of things...
+//
+//    1. Creates the migration table if it does not exist.
+//    2. Repairs any hashes that need to be updated.
+//    3. Executes each new migration in the order they were added.
+//    4. Adds each now migration record to the migration table.
+//    5. Returns a log of all migrations.
+//
+// All the migrations are run as a single transaction. If a migration fails or
+// an error is encountered, an error is returned and none of the migrations are
+// applied. This ensures that if something goes wrong there is not an unknown
+// state where some migrations are applied and some are not.
+//
+// It is important to note that Run does not validate the integrity of past
+// migrations. Once a migration has been run the hash is stored in the DB but
+// the hash is not checked again. This means that if changes are made to a
+// migration statement after it has already been run, the expected state of the
+// DB and the state after migrations have been run may be different.
+//
+// The logic for not checking the hash on each subsequent run is simple. "alter
+// table" and "ALTER TABLE" produce the same results, but have a different hash.
+// To keep auto-formatters and linter changes from breaking old migrations Run
+// will ignore these and all other changes to the statement and args.
+//
+// If you want to validate the hash you can use RunStrict instead. If you chose
+// RunStrict you may need to use the RepairHash method to manually update
+// migrations that had non-substantive changes.
 func (m *Migrator) Run() ([]MigrationLog, error) {
+	m.strict = false
 	err := m.run()
 	return m.log, err
 }
 
-// run each Migration in the Migrator.
+// RunStrict executes the new migrations against the DB like Run, but in strict
+// mode. Strict mode causes the migrations to fail if an existing record hash
+// does not match the hash of the migration.
+func (m *Migrator) RunStrict() ([]MigrationLog, error) {
+	m.strict = true
+	err := m.run()
+	return m.log, err
+}
+
+// run all the Migrator.migrations.
 func (m *Migrator) run() error {
-	success := true
-	// Create transaction
+	commit := true
+
+	// Create the migration table if it does not exist
+	if !m.backend.HasMigrationTable() {
+		err := m.createMigrationTable()
+		if err != nil {
+			return err
+		}
+	}
+
+	// Create transaction for migrations
 	tx, err := m.db.Begin()
 	if err != nil {
 		return err
 	}
 	defer func() {
-		if success {
+		if commit {
 			tx.Commit()
 			return
 		}
 		tx.Rollback()
 	}()
 
-	// Create the migration table if it does not exist
-	if !m.hasMigrationTable() {
-		q := m.migrationTableStmt()
-		_, err = tx.Exec(q)
-		m.log = append(m.log, MigrationLog{
-			Name:    fmt.Sprintf("create_%s_table", m.TableName),
-			Hash:    hashQuery(q),
-			Comment: fmt.Sprintf("created '%s' table", m.TableName),
-			Error:   err,
-		})
-		if err != nil {
-			success = false
-			return err
-		}
-	}
-
 	// Get previous migrations
-	previous := []MigrationRecord{}
-
-	err = m.db.Select(previous, m.name(`SELECT name, hash FROM ??`))
+	prev, err := m.backend.QueryPrevious()
 	if err != nil {
 		return err
 	}
+	m.previous = prev
 
 	// Run each migration
 	for _, mig := range m.migrations {
-		err = mig.run(tx)
-		// If the migration record insert fails something is wrong, and we should stop.
-		m.log = append(m.log, MigrationLog{
-			Name:    mig.Name,
-			Hash:    mig.hash,
-			Comment: mig.Comment,
-			Error:   err,
-		})
-
-		if err != nil {
-			success = false
-			break
-		}
-
-		err = mig.insertRecord(tx, m)
+		err = m.executeMigration(tx, mig)
 		if err != nil {
 			return err
 		}
@@ -159,71 +274,94 @@ func (m *Migrator) run() error {
 	return err
 }
 
-// hasMigrationTable checks to see if the migration table exists already.
-func (m Migrator) hasMigrationTable() bool {
-	q := m.name(`SELECT EXISTS(
-		SELECT *
-		FROM information_schema.tables
-		WHERE
-		  table_schema = 'public' AND
-          table_name = '??'
-	);`)
-
-	exists := false
-	err := m.db.Get(&exists, q)
-
-	// If this query fails something has gone terribly wrong.
-	if err != nil {
-		panic(err)
+// Executes a single migration
+func (m *Migrator) executeMigration(tx *sql.Tx, mig Migration) error {
+	mLog := MigrationLog{
+		Name:    mig.Name,
+		Hash:    mig.hash,
+		Status:  SUCCESS,
+		Details: "ran migration successfully",
 	}
-	return exists
-}
+	defer func() {
+		m.log = append(m.log, mLog)
+	}()
 
-// queryRecord returns the records of all migrations.
-func (m Migrator) queryRecords() ([]MigrationRecord, error) {
-	q := m.name(`SELECT id, name, hash, time FROM ?? ORDER BY "time"`)
-	mr := []MigrationRecord{}
-	var err error = nil
-	err = m.db.Select(&mr, q)
-	if err != nil {
-		return nil, err
+	hash, exists := m.previous[mig.Name]
+	if exists {
+		mLog.Status = PREVIOUS
+		mLog.Details = "migration already run"
+		if hash != mig.hash {
+			d := fmt.Sprintf("hash mismatch DB: '%s' Migration: '%s'", hash, mig.hash)
+			mLog.Details = d
+			if m.strict {
+				mLog.Status = ERROR_HASH
+				return errors.New(fmt.Sprintf("%s %s", mig.Name, d))
+			}
+		}
+		return nil
 	}
-	return mr, nil
+
+	err := mig.run(tx)
+	if err != nil {
+		mLog.Status = ERROR
+		mLog.Details = fmt.Sprintf("failed: %s", err)
+		return err
+	}
+
+	// If the migration record insert fails something is wrong, and we should stop.
+	err = mig.insertRecord(tx, m)
+	if err != nil {
+		mLog.Status = ERROR
+		mLog.Details = fmt.Sprintf("record insert failed: %s", err)
+		return err
+	}
+	return nil
 }
 
-// Returns the create migration table statement.
-func (m Migrator) migrationTableStmt() string {
-	return m.name(`CREATE TABLE ??
-	(
-		id      SERIAL                     NOT NULL,
-		name    VARCHAR(64)                NOT NULL,
-		hash    VARCHAR(32)                NOT NULL,
-		date    TIMESTAMP    DEFAULT NOW() NOT NULL,
-        comment VARCHAR(512)               NOT NULL
-	);
-	
-	COMMENT ON TABLE ?? IS 'list the schema changes';
-	
-	CREATE UNIQUE INDEX ??_id_uindex ON ?? (id);
-	
-	CREATE UNIQUE INDEX ??_name_uindex ON ?? (name);
-	
-	ALTER TABLE ?? 
-		ADD CONSTRAINT ??_pk PRIMARY KEY (id);`)
+// Creates the migrations table
+func (m *Migrator) createMigrationTable() error {
+	q, err := m.backend.CreateMigrationTable()
+
+	l := MigrationLog{
+		Name:    fmt.Sprintf("create_%s_table", m.TableName),
+		Hash:    hashQuery(q),
+		Status:  SUCCESS,
+		Details: fmt.Sprintf("created '%s' table", m.TableName),
+	}
+
+	if err != nil {
+		l.Status = ERROR
+		l.Details = err.Error()
+	}
+
+	m.log = append(m.log, l)
+	return err
 }
 
+// name takes a query and replaces all instances of "??" with the Migrator
+// TableName
 func (m Migrator) name(query string) string {
 	return strings.Replace(query, "??", m.TableName, -1)
 }
 
-func New(db *sqlx.DB, tableName string) Migrator {
-	return Migrator{
-		db:        db,
-		TableName: tableName,
+// New creates and returns a new Migrator instance. You typically should use one
+// Migrator per database.
+func New(db *sqlx.DB, tableName string) (Migrator, error) {
+	m := Migrator{
+		db:         db,
+		TableName:  tableName,
+		previous:   make(map[string]string),
+		migrations: make([]Migration, 0, 1),
+		repair:     make(map[string]bool),
+		names:      make(map[string]bool),
 	}
+	b := BackendType(db.DriverName())
+	err := m.UseBackend(b)
+
+	return m, err
 }
 
-// The hashQuery function is for creating a checksum for each migration.
+// The hashQuery function is for creating a checksum for each Migration.
 func hashQuery(query string, args ...interface{}) string {
 	var b strings.Builder
 	b.WriteString(query)
