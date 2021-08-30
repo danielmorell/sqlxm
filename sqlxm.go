@@ -2,8 +2,6 @@ package sqlxm
 
 import (
 	"crypto/md5"
-	"database/sql"
-	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -20,9 +18,9 @@ const (
 )
 
 var defaultBackends = map[string][]string{
-	"postgres":  {"postgres", "pgx", "pq-timeouts", "cloudsqlpostgres", "ql", "nrpostgres", "cockroach"},
+	"postgres":  {"postgres", "pgx", "pq-timeouts", "cloudsqlpostgres", "nrpostgres", "cockroach"},
 	"mysql":     {"mysql", "nrmysql"},
-	"sqlite":    {"sqlite3", "nrsqlite3"},
+	"sqlite":    {"sqlite", "sqlite3", "nrsqlite3"},
 	"oracle":    {"oci8", "ora", "goracle", "godror"},
 	"sqlserver": {"sqlserver"},
 }
@@ -46,17 +44,19 @@ func BackendType(driverName string) string {
 	return itype.(string)
 }
 
-var registeredBackends = map[string]Backend{
+var registeredBackends = map[string]backends.Backend{
+	"mysql":    &backends.MySQL{},
 	"postgres": &backends.Postgres{},
+	"sqlite":   &backends.SQLite{},
 }
 
 // RegisterBackend adds a new DB Backend to SQLXM for Migrator to use to run
 // queries. A backend handles peculiarities in SQL dialects and can help
 // abstract alternate implementations.
-func RegisterBackend(key string, backend Backend) error {
+func RegisterBackend(key string, backend backends.Backend) error {
 	_, exists := registeredBackends[key]
 	if exists {
-		return errors.New(fmt.Sprintf("backend with key '%s' already exists", key))
+		return fmt.Errorf("backend with key '%s' already exists", key)
 	}
 	registeredBackends[key] = backend
 	return nil
@@ -73,35 +73,22 @@ type Migration struct {
 }
 
 // Execute the migration on the database
-func (m Migration) run(tx *sql.Tx) error {
+func (m Migration) run(tx *sqlx.Tx) error {
 	_, err := tx.Exec(m.Statement, m.args...)
 	return err
 }
 
 // Insert the migration record row into the migration table
-func (m Migration) insertRecord(tx *sql.Tx, migrator *Migrator) error {
+func (m Migration) insertRecord(tx *sqlx.Tx, migrator *Migrator) error {
 	return migrator.backend.InsertRecord(tx, m.Name, m.hash, m.Comment)
 }
 
+// A MigrationLog represents the results from a single migration.
 type MigrationLog struct {
 	Name    string
 	Hash    string
 	Status  int
 	Details string
-}
-
-type Backend interface {
-	// Setup does the initial configuration of the backend.
-	Setup(table string, db *sqlx.DB)
-	// InsertRecord migration record into the DB.
-	InsertRecord(tx *sql.Tx, name string, hash string, comment string) error
-	// HasMigrationTable returns true if the migration table exists.
-	HasMigrationTable() bool
-	// QueryPrevious queries and sets the records of all previous migrations.
-	QueryPrevious() (map[string]string, error)
-	// CreateMigrationTable makes the migrations table, and return the query used to
-	// do it.
-	CreateMigrationTable() (string, error)
 }
 
 // Migrator handles the process of migrating your database. Each instance of
@@ -122,20 +109,26 @@ type Migrator struct {
 	// match for a migration.
 	strict bool
 	// The names of migrations that need the hash repaired.
-	repair map[string]bool
+	repair map[string]string
 	// Set of added migrations
 	names map[string]bool
 	// The query runner for the db.
-	backend Backend
+	backend backends.Backend
+	// The SQL 'table_schema' in Postgres this is typically 'public' in MySQL
+	// this is the name of the DB.
+	tableSchema string
 }
 
+// UseBackend changes the default backend to a custom or built-in backend. The
+// backend must be registered before it can be used. A backend can be registered
+// once and used on multiple migrator instances.
 func (m *Migrator) UseBackend(key string) error {
 	b, ok := registeredBackends[key]
 	if !ok {
-		return errors.New(fmt.Sprintf("backend '%s' is not a registered backend", key))
+		return fmt.Errorf("backend '%s' is not a registered backend", key)
 	}
 	m.backend = b
-	m.backend.Setup(m.TableName, m.db)
+	m.backend.Setup(m.db, m.TableName, m.tableSchema)
 	return nil
 }
 
@@ -153,7 +146,7 @@ func (m *Migrator) UseBackend(key string) error {
 // added.
 func (m *Migrator) AddMigration(name string, comment string, statement string, args ...interface{}) error {
 	if m.names[name] {
-		return errors.New(fmt.Sprintf("migration '%s' alraedy exists", name))
+		return fmt.Errorf("migration '%s' alraedy exists", name)
 	}
 	// Add name to set
 	m.names[name] = true
@@ -183,7 +176,7 @@ func (m *Migrator) AddMigration(name string, comment string, statement string, a
 // if the migrations fail.
 func (m *Migrator) RepairHash(names ...string) {
 	for _, n := range names {
-		m.repair[n] = true
+		m.repair[n] = ""
 	}
 }
 
@@ -233,21 +226,24 @@ func (m *Migrator) RunStrict() ([]MigrationLog, error) {
 
 // run all the Migrator.migrations.
 func (m *Migrator) run() error {
-	commit := true
-
 	// Create the migration table if it does not exist
-	if !m.backend.HasMigrationTable() {
+	exists, err := m.backend.HasMigrationTable()
+	if err != nil {
+		return fmt.Errorf("the migration table check failed: %w", err)
+	}
+	if !exists {
 		err := m.createMigrationTable()
 		if err != nil {
-			return err
+			return fmt.Errorf("create '%s' table failed: %w", m.TableName, err)
 		}
 	}
 
 	// Create transaction for migrations
-	tx, err := m.db.Begin()
+	tx, err := m.db.Beginx()
 	if err != nil {
-		return err
+		return fmt.Errorf("begin transaction failed: %w", err)
 	}
+	commit := true
 	defer func() {
 		if commit {
 			tx.Commit()
@@ -256,10 +252,17 @@ func (m *Migrator) run() error {
 		tx.Rollback()
 	}()
 
+	err = m.repairHashes(tx)
+	if err != nil {
+		commit = false
+		return fmt.Errorf("repair hashes failed: %w", err)
+	}
+
 	// Get previous migrations
 	prev, err := m.backend.QueryPrevious()
 	if err != nil {
-		return err
+		commit = false
+		return fmt.Errorf("get previous migrations failed: %w", err)
 	}
 	m.previous = prev
 
@@ -267,15 +270,15 @@ func (m *Migrator) run() error {
 	for _, mig := range m.migrations {
 		err = m.executeMigration(tx, mig)
 		if err != nil {
-			return err
+			commit = false
+			return fmt.Errorf("run error on '%s': %w", mig.Name, err)
 		}
 	}
-
 	return err
 }
 
 // Executes a single migration
-func (m *Migrator) executeMigration(tx *sql.Tx, mig Migration) error {
+func (m *Migrator) executeMigration(tx *sqlx.Tx, mig Migration) error {
 	mLog := MigrationLog{
 		Name:    mig.Name,
 		Hash:    mig.hash,
@@ -286,16 +289,17 @@ func (m *Migrator) executeMigration(tx *sql.Tx, mig Migration) error {
 		m.log = append(m.log, mLog)
 	}()
 
-	hash, exists := m.previous[mig.Name]
+	_, exists := m.previous[mig.Name]
 	if exists {
 		mLog.Status = PREVIOUS
 		mLog.Details = "migration already run"
-		if hash != mig.hash {
-			d := fmt.Sprintf("hash mismatch DB: '%s' Migration: '%s'", hash, mig.hash)
+		h, valid := m.hashIsValid(mig)
+		if !valid {
+			d := fmt.Sprintf("hash mismatch DB: '%s' Migration: '%s'", h, mig.hash)
 			mLog.Details = d
 			if m.strict {
 				mLog.Status = ERROR_HASH
-				return errors.New(fmt.Sprintf("%s %s", mig.Name, d))
+				return fmt.Errorf("%s %s", mig.Name, d)
 			}
 		}
 		return nil
@@ -338,22 +342,45 @@ func (m *Migrator) createMigrationTable() error {
 	return err
 }
 
-// name takes a query and replaces all instances of "??" with the Migrator
-// TableName
-func (m Migrator) name(query string) string {
-	return strings.Replace(query, "??", m.TableName, -1)
+// Gets the new hashes calls the backend RepairHashes method.
+func (m *Migrator) repairHashes(tx *sqlx.Tx) error {
+	if len(m.repair) == 0 {
+		return nil
+	}
+	for _, mig := range m.migrations {
+		if _, ok := m.repair[mig.Name]; !ok {
+			continue
+		}
+		m.repair[mig.Name] = mig.hash
+	}
+
+	return m.backend.RepairHashes(tx, m.repair)
+}
+
+// hashIsValid returns stored hash and true if the hash is valid.
+func (m Migrator) hashIsValid(mig Migration) (string, bool) {
+	repaired, exists := m.repair[mig.Name]
+	if exists && repaired == mig.hash {
+		return repaired, true
+	}
+	previous, exists := m.previous[mig.Name]
+	if !exists {
+		return mig.hash, true
+	}
+	return previous, previous == mig.hash
 }
 
 // New creates and returns a new Migrator instance. You typically should use one
 // Migrator per database.
-func New(db *sqlx.DB, tableName string) (Migrator, error) {
+func New(db *sqlx.DB, tableName string, tableSchema string) (Migrator, error) {
 	m := Migrator{
-		db:         db,
-		TableName:  tableName,
-		previous:   make(map[string]string),
-		migrations: make([]Migration, 0, 1),
-		repair:     make(map[string]bool),
-		names:      make(map[string]bool),
+		db:          db,
+		TableName:   tableName,
+		tableSchema: tableSchema,
+		previous:    make(map[string]string),
+		migrations:  make([]Migration, 0, 1),
+		repair:      make(map[string]string),
+		names:       make(map[string]bool),
 	}
 	b := BackendType(db.DriverName())
 	err := m.UseBackend(b)

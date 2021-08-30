@@ -1,4 +1,7 @@
+# Editor Stuff
 .idea
 .vscode
 
+# Test Stuff
 .env
+testdb.sqlite

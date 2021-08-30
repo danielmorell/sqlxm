@@ -1,7 +1,7 @@
 package backends
 
 import (
-	"database/sql"
+	"fmt"
 
 	"github.com/jmoiron/sqlx"
 )
@@ -10,67 +10,45 @@ type Postgres struct {
 	// The database connection to use for this backend.
 	db *sqlx.DB
 	// The migration table name
-	migrationTable string
+	table string
+	// The SQL 'table_schema' usually is 'public'
+	tableSchema string
 }
 
 // Setup does the initial configuration of the backend.
-func (p *Postgres) Setup(table string, db *sqlx.DB) {
-	p.migrationTable = table
+func (p *Postgres) Setup(db *sqlx.DB, table string, tableSchema string) {
 	p.db = db
+	p.table = table
+	p.tableSchema = tableSchema
 }
 
 // InsertRecord migration record into the DB.
-func (p *Postgres) InsertRecord(tx *sql.Tx, name string, hash string, comment string) error {
-	s := nameTable(`INSERT INTO ?? (name, hash, comment) VALUES ($1, $2, $3);`, p.migrationTable)
+func (p *Postgres) InsertRecord(tx *sqlx.Tx, name string, hash string, comment string) error {
+	q := nameTable(`INSERT INTO ?? (name, hash, comment) VALUES ($1, $2, $3);`, p.table)
 
-	_, err := tx.Exec(s, name, hash, comment)
-
-	return err
+	return InsertRecord(tx, q, name, hash, comment)
 }
 
 // HasMigrationTable returns true if the migration table exists.
-func (p *Postgres) HasMigrationTable() bool {
-	q := nameTable(`SELECT EXISTS(
-		SELECT *
-		FROM information_schema.tables
-		WHERE
-		  table_schema = 'public' AND
-          table_name = '??'
-	);`, p.migrationTable)
-
-	exists := false
-	err := p.db.Get(&exists, q)
-
-	// If this query fails something has gone terribly wrong.
-	if err != nil {
-		panic(err)
-	}
-	return exists
+func (p *Postgres) HasMigrationTable() (bool, error) {
+	q := fmt.Sprintf(`SELECT EXISTS(
+		SELECT * FROM information_schema.tables
+		WHERE table_schema = '%s' 
+		AND table_name = '%s'
+	);`, p.tableSchema, p.table)
+	return HasMigrationTable(p.db, q)
 }
 
 // QueryPrevious queries and sets the records of all previous migrations.
 func (p *Postgres) QueryPrevious() (map[string]string, error) {
-	q := nameTable(`SELECT name, hash FROM ??;`, p.migrationTable)
-	mr := make([]MigrationRecord, 0, 10)
-
-	err := p.db.Select(&mr, q)
-	if err != nil {
-		return nil, err
-	}
-
-	prev := make(map[string]string)
-	for _, r := range mr {
-		prev[r.Name] = r.Hash
-	}
-
-	return prev, nil
+	q := nameTable(`SELECT name, hash FROM ??;`, p.table)
+	return QueryPrevious(p.db, q)
 }
 
 // CreateMigrationTable makes the migrations table, and return the query used to
 // do it.
 func (p *Postgres) CreateMigrationTable() (string, error) {
-	q := nameTable(`CREATE TABLE ??
-	(
+	q := nameTable(`CREATE TABLE ?? (
 		id      SERIAL                     NOT NULL,
 		name    VARCHAR(64)                NOT NULL,
 		hash    VARCHAR(32)                NOT NULL,
@@ -85,9 +63,11 @@ func (p *Postgres) CreateMigrationTable() (string, error) {
 	CREATE UNIQUE INDEX ??_name_uindex ON ?? (name);
 	
 	ALTER TABLE ?? 
-		ADD CONSTRAINT ??_pk PRIMARY KEY (id);`, p.migrationTable)
+		ADD CONSTRAINT ??_pk PRIMARY KEY (id);`, p.table)
+	return CreateMigrationTable(p.db, q)
+}
 
-	_, err := p.db.Exec(q)
-
-	return q, err
+func (p *Postgres) RepairHashes(tx *sqlx.Tx, hashes map[string]string) error {
+	q := nameTable(`UPDATE ?? SET hash = $1 WHERE name = $2`, p.table)
+	return RepairHashes(tx, q, hashes)
 }
