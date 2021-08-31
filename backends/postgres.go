@@ -49,7 +49,8 @@ func (p *Postgres) QueryPrevious() (map[string]string, error) {
 // do it.
 func (p *Postgres) CreateMigrationTable() (string, error) {
 	q := nameTable(`CREATE TABLE ?? (
-		id      SERIAL                     NOT NULL,
+		id      SERIAL
+			CONSTRAINT ??_pk PRIMARY KEY,
 		name    VARCHAR(64)                NOT NULL,
 		hash    VARCHAR(32)                NOT NULL,
 		date    TIMESTAMP    DEFAULT NOW() NOT NULL,
@@ -58,12 +59,7 @@ func (p *Postgres) CreateMigrationTable() (string, error) {
 	
 	COMMENT ON TABLE ?? IS 'list the schema changes';
 	
-	CREATE UNIQUE INDEX ??_id_uindex ON ?? (id);
-	
-	CREATE UNIQUE INDEX ??_name_uindex ON ?? (name);
-	
-	ALTER TABLE ?? 
-		ADD CONSTRAINT ??_pk PRIMARY KEY (id);`, p.table)
+	CREATE UNIQUE INDEX ??_name_uindex ON ?? (name);`, p.table)
 	return CreateMigrationTable(p.db, q)
 }
 
