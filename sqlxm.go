@@ -105,9 +105,9 @@ type Migrator struct {
 	log []MigrationLog
 	// Previous migrations to make sure we don't run them twice.
 	previous map[string]string
-	// Strict mode stops migrations and returns an error if the hashes don't
+	// safe mode stops migrations and returns an error if the hashes don't
 	// match for a migration.
-	strict bool
+	safe bool
 	// The names of migrations that need the hash repaired.
 	repair map[string]string
 	// Set of added migrations
@@ -166,7 +166,7 @@ func (m *Migrator) AddMigration(name string, comment string, statement string, a
 }
 
 // RepairHash finds an existing migration by name and updates the hash in the
-// DB. This is useful if you are using RunStrict, and there have been
+// DB. This is useful if you are using Run in safe mode, and there have been
 // non-substantive changes to the Migration.Statement such as formatting or
 // indenting changes.
 //
@@ -195,31 +195,41 @@ func (m *Migrator) RepairHash(names ...string) {
 // applied. This ensures that if something goes wrong there is not an unknown
 // state where some migrations are applied and some are not.
 //
-// It is important to note that Run does not validate the integrity of past
-// migrations. Once a migration has been run the hash is stored in the DB but
-// the hash is not checked again. This means that if changes are made to a
-// migration statement after it has already been run, the expected state of the
-// DB and the state after migrations have been run may be different.
+// It is important to note that Run validates the integrity of past
+// migrations. Once a migration has been run the hash is stored in the DB and
+// the hash is checked against the migration hash each time it is run. This
+// means that if changes are made to a migration statement after it has already
+// been run, the two hashes will not match. In this case Run will return a hash
+// mismatch error.
 //
-// The logic for not checking the hash on each subsequent run is simple. "alter
-// table" and "ALTER TABLE" produce the same results, but have a different hash.
-// To keep auto-formatters and linter changes from breaking old migrations Run
-// will ignore these and all other changes to the statement and args.
+// The reason the hash is checked on each subsequent run is simple. Adding "NOT
+// NULL" to an already run "CREATE TABLE" migration will cause that brand-new
+// development database you just created to have the right column definition.
+// However, the production database will still have that column defined as
+// "nullable" since the migration is not run again. This can cause the state of
+// the development database and production database to slowly get out of sync.
 //
-// If you want to validate the hash you can use RunStrict instead. If you chose
-// RunStrict you may need to use the RepairHash method to manually update
-// migrations that had non-substantive changes.
+// If you have a style change like making all SQL keywords uppercase you can use
+// RepairHash to rehash the migration and update the Hash in the database.
+//
+// If you want to skip the hash validation you can use RunUnsafe instead.
 func (m *Migrator) Run() ([]MigrationLog, error) {
-	m.strict = false
+	m.safe = true
 	err := m.run()
 	return m.log, err
 }
 
-// RunStrict executes the new migrations against the DB like Run, but in strict
-// mode. Strict mode causes the migrations to fail if an existing record hash
-// does not match the hash of the migration.
-func (m *Migrator) RunStrict() ([]MigrationLog, error) {
-	m.strict = true
+// RunUnsafe executes the new migrations against the DB like Run, but in unsafe
+// mode. Unsafe mode will not stop and return an error if an existing record
+// hash does not match the hash of the migration.
+//
+// The reason you may not want the hash checked on each subsequent run is simple.
+// "alter table" and "ALTER TABLE" produce the same results, but have a
+// different hash. To keep auto-formatters and linter changes from breaking old
+// migrations RunUnsafe will ignore these and all other changes to the statement
+// and args.
+func (m *Migrator) RunUnsafe() ([]MigrationLog, error) {
+	m.safe = false
 	err := m.run()
 	return m.log, err
 }
@@ -297,7 +307,7 @@ func (m *Migrator) executeMigration(tx *sqlx.Tx, mig Migration) error {
 		if !valid {
 			d := fmt.Sprintf("hash mismatch DB: '%s' Migration: '%s'", h, mig.hash)
 			mLog.Details = d
-			if m.strict {
+			if m.safe {
 				mLog.Status = ERROR_HASH
 				return fmt.Errorf("%s %s", mig.Name, d)
 			}

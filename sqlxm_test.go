@@ -188,8 +188,8 @@ func TestMainE2E(t *testing.T) {
 		t.Run(fmt.Sprintf("%sTestE2E", d.title), func(t *testing.T) {
 			testE2E(t, d)
 		})
-		t.Run(fmt.Sprintf("%stestStrict", d.title), func(t *testing.T) {
-			testStrict(t, d)
+		t.Run(fmt.Sprintf("%stestSafe", d.title), func(t *testing.T) {
+			testSafe(t, d)
 		})
 		t.Run(fmt.Sprintf("%stestDuplicate", d.title), func(t *testing.T) {
 			testDuplicate(t, d)
@@ -315,7 +315,7 @@ func testE2E(t *testing.T, dbms testDBMS) {
 }
 
 // Test to make sure that migrations with the same name will
-func testStrict(t *testing.T, dbms testDBMS) {
+func testSafe(t *testing.T, dbms testDBMS) {
 	pg, done := connectToDB(dbms.name)
 	defer done("migrations", "users")
 
@@ -342,8 +342,8 @@ func testStrict(t *testing.T, dbms testDBMS) {
 		t.Errorf("migrator run error: %s", err)
 	}
 
-	// In strict mode the second run will return an error.
-	t.Run("RunStrict", func(t *testing.T) {
+	// In safe mode the second run will return an error.
+	t.Run("RunSafe", func(t *testing.T) {
 		migrator2, err := New(pg, "migrations", dbms.tableSchema)
 		if err != nil {
 			t.Error(err)
@@ -362,9 +362,9 @@ func testStrict(t *testing.T, dbms testDBMS) {
 			t.Error(err)
 		}
 
-		l, err := migrator2.RunStrict()
+		l, err := migrator2.Run()
 		if err == nil || ERROR_HASH != l[len(l)-1].Status {
-			t.Error("migrator run strict error: hash mismatch check failed")
+			t.Error("migrator run safe error: hash mismatch check failed")
 		}
 	})
 
@@ -387,7 +387,7 @@ func testStrict(t *testing.T, dbms testDBMS) {
 			t.Error(err)
 		}
 
-		l, err := migrator3.Run()
+		l, err := migrator3.RunUnsafe()
 		lastLog := l[len(l)-1]
 		if err != nil {
 			t.Error("migrator run loose error: run failed")
@@ -421,7 +421,7 @@ func testStrict(t *testing.T, dbms testDBMS) {
 
 		migrator4.RepairHash("create_user_table")
 
-		l, err := migrator4.RunStrict()
+		l, err := migrator4.Run()
 
 		var lastLog = MigrationLog{}
 		if len(l) > 0 {
