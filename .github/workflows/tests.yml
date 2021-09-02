@@ -22,7 +22,7 @@ jobs:
         run: cp .env.sample .env
 
       - name: Build Docker DBs
-        run: docker compose up -d
+        run: docker-compose up -d
 
       - name: Build
         run: go build -v ./...
