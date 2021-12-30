@@ -9,6 +9,7 @@ on:
 jobs:
 
   build:
+    name: Run Unit and E2E Tests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v2
