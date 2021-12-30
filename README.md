@@ -27,7 +27,8 @@ $ go get github.com/danielmorell/sqlxm
 There are three basic functions that set up SQLX Migrator and start running your migrations.
 
 1. `sqlxm.New()` creates a new `sqlxm.Migrator` instance that can be used to track and run migrations.
-2. `Migrator.AddMigration()` creates a new migration to run and keep track of.
+2. `Migrator.AddMigration()` creates a new migration to run and keep track of. Migrations are run in the order they 
+   are added.
 3. `Migrator.Run()` takes all the previous migrations added with `Migrator.AddMigration()` and makes sure they have been
    applied to database or applies them.
 
@@ -129,6 +130,9 @@ TABLE` do the same thing but produce a different hash.
 
 In a scenario where you need to update the hash of the migration, you can use the `Migrator.RepairHash()` method to 
 update the hash of previous migrations.
+
+**Note:** safe mode will not prevent you from writing `DROP TABLE users` as a migration. It simply validates the 
+integrity of the migration source with the already run migration.
 
 ### Backends
 
