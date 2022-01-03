@@ -50,7 +50,7 @@ var registeredBackends = map[string]backends.Backend{
 	"sqlite":   &backends.SQLite{},
 }
 
-// RegisterBackend adds a new DB Backend to SQLXM for Migrator to use to run
+// RegisterBackend adds a new DB Backend to sqlxm for Migrator to use to run
 // queries. A backend handles peculiarities in SQL dialects and can help
 // abstract alternate implementations.
 func RegisterBackend(key string, backend backends.Backend) error {
