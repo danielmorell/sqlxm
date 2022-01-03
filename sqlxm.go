@@ -111,7 +111,7 @@ type Migrator struct {
 	// The names of migrations that need the hash repaired.
 	repair map[string]string
 	// Set of added migrations
-	names map[string]bool
+	names map[string]struct{}
 	// The query runner for the db.
 	backend backends.Backend
 	// The SQL 'table_schema' in Postgres this is typically 'public' in MySQL
@@ -145,11 +145,11 @@ func (m *Migrator) UseBackend(key string) error {
 // An error is returned if a migration with the same name has already been
 // added.
 func (m *Migrator) AddMigration(name string, comment string, statement string, args ...interface{}) error {
-	if m.names[name] {
+	if _, ok := m.names[name]; ok {
 		return fmt.Errorf("migration '%s' alraedy exists", name)
 	}
 	// Add name to set
-	m.names[name] = true
+	m.names[name] = struct{}{}
 
 	// Create the new migration
 	mig := Migration{
@@ -390,7 +390,7 @@ func New(db *sqlx.DB, tableName string, tableSchema string) (Migrator, error) {
 		previous:    make(map[string]string),
 		migrations:  make([]Migration, 0, 1),
 		repair:      make(map[string]string),
-		names:       make(map[string]bool),
+		names:       make(map[string]struct{}),
 	}
 	b := BackendType(db.DriverName())
 	err := m.UseBackend(b)
